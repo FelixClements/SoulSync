@@ -1,9 +1,7 @@
 name: Sync with Upstream
 
 on:
-  # Run manually
   workflow_dispatch:
-  # Run daily at midnight UTC
   schedule:
     - cron: '0 0 * * *'
 
@@ -47,5 +45,14 @@ jobs:
       - name: Merge upstream changes
         if: steps.check.outputs.updates_available == 'true'
         run: |
-          git merge upstream/main --no-edit
-          git push origin main
+          if ! git merge upstream/main --no-edit --no-commit 2>/tmp/merge_error; then
+            echo "Merge conflicts detected, attempting rebase..."
+            git merge --abort || true
+            if ! git rebase upstream/main; then
+              echo "Rebase failed, aborting rebase..."
+              git rebase --abort
+              echo "conflict=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+          git push origin main || echo "Push failed, may already be up to date"
