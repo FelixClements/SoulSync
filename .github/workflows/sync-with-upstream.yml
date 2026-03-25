@@ -1,0 +1,51 @@
+name: Sync with Upstream
+
+on:
+  # Run manually
+  workflow_dispatch:
+  # Run daily at midnight UTC
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/Nezreka/SoulSync.git 2>/dev/null || true
+
+      - name: Fetch upstream changes
+        run: |
+          git fetch upstream
+
+      - name: Check for updates
+        id: check
+        run: |
+          # Check if upstream has new commits
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse upstream/main)
+          
+          if [ "$LOCAL" != "$UPSTREAM" ]; then
+            echo "updates_available=true" >> $GITHUB_OUTPUT
+            echo "Local: $LOCAL"
+            echo "Upstream: $UPSTREAM"
+          else
+            echo "updates_available=false" >> $GITHUB_OUTPUT
+            echo "Already up to date with upstream"
+          fi
+
+      - name: Merge upstream changes
+        if: steps.check.outputs.updates_available == 'true'
+        run: |
+          git merge upstream/main --no-edit
+          git push origin main
