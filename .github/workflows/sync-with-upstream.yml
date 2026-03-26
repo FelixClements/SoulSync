@@ -18,6 +18,11 @@ jobs:
           ref: main
           fetch-depth: 0
 
+      - name: Configure Git identity
+        run: |
+          git config --global user.email "minimax@opencode.io"
+          git config --global user.name "Sisyphus Bot"
+
       - name: Add upstream remote
         run: |
           git remote add upstream https://github.com/Nezreka/SoulSync.git 2>/dev/null || true
