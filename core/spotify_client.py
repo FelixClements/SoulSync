@@ -14,7 +14,7 @@ logger = get_logger("spotify_client")
 # Global rate limiting variables
 _last_api_call_time = 0
 _api_call_lock = threading.Lock()
-MIN_API_INTERVAL = 1.5  # 1.5 seconds wait after each api call.
+MIN_API_INTERVAL = 60.0  # Increase minimum API interval to 60 seconds
 
 # Request queuing for burst handling
 import queue
