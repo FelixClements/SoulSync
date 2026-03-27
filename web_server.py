@@ -1855,8 +1855,13 @@ def get_cached_transfer_data():
         # Cache expired or empty, fetch new data
         live_transfers_lookup = {}
         try:
+            # Skip Soulseek API call if we already know it's disconnected (avoid timeout spam)
+            soulseek_known_down = not _status_cache.get('soulseek', {}).get('connected', True)
+
             # First, get Soulseek downloads from API
-            transfers_data = run_async(soulseek_client._make_request('GET', 'transfers/downloads'))
+            transfers_data = None
+            if not soulseek_known_down:
+                transfers_data = run_async(soulseek_client._make_request('GET', 'transfers/downloads'))
             if transfers_data:
                 all_transfers = []
                 for user_data in transfers_data:
@@ -1872,8 +1877,9 @@ def get_cached_transfer_data():
                     live_transfers_lookup[key] = transfer
 
             # Also add YouTube/Tidal/Qobuz downloads (through orchestrator)
+            # Note: get_all_downloads() also hits slskd API — skip if we know it's down
             try:
-                all_downloads = run_async(soulseek_client.get_all_downloads())
+                all_downloads = run_async(soulseek_client.get_all_downloads()) if not soulseek_known_down else []
                 for download in all_downloads:
                     # Only add streaming source downloads (Soulseek ones are already in the lookup)
                     if download.username in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl'):
@@ -4499,7 +4505,7 @@ def handle_settings():
             if 'active_media_server' in new_settings:
                 config_manager.set_active_media_server(new_settings['active_media_server'])
 
-            for service in ['spotify', 'plex', 'jellyfin', 'navidrome', 'soulseek', 'download_source', 'settings', 'database', 'metadata_enhancement', 'file_organization', 'playlist_sync', 'tidal', 'tidal_download', 'qobuz', 'hifi_download', 'deezer_download', 'listenbrainz', 'acoustid', 'lastfm', 'genius', 'import', 'lossy_copy', 'listening_stats', 'ui_appearance', 'youtube', 'content_filter', 'itunes', 'm3u_export', 'musicbrainz', 'deezer', 'audiodb', 'metadata', 'hydrabase']:
+            for service in ['spotify', 'plex', 'jellyfin', 'navidrome', 'soulseek', 'download_source', 'settings', 'database', 'metadata_enhancement', 'file_organization', 'playlist_sync', 'tidal', 'tidal_download', 'qobuz', 'hifi_download', 'deezer_download', 'listenbrainz', 'acoustid', 'lastfm', 'genius', 'import', 'lossy_copy', 'listening_stats', 'ui_appearance', 'youtube', 'content_filter', 'itunes', 'm3u_export', 'musicbrainz', 'deezer', 'audiodb', 'metadata', 'hydrabase', 'security']:
                 if service in new_settings:
                     for key, value in new_settings[service].items():
                         config_manager.set(f'{service}.{key}', value)
@@ -7228,18 +7234,34 @@ def stream_enhanced_search_track():
             'duration_ms': duration_ms
         })()
 
-        # Generate search queries based on download source mode
-        # - Soulseek: Track name only (avoids keyword filtering on artist names)
-        # - YouTube: Include artist name (provides context to find actual music)
+        # Determine effective stream source
+        # stream_source: "youtube" (default, instant) or "active" (use download source)
+        stream_source = config_manager.get('download_source.stream_source', 'youtube')
         download_mode = config_manager.get('download_source.mode', 'soulseek')
+
+        # Resolve the effective mode for streaming
+        if stream_source == 'youtube':
+            effective_mode = 'youtube'
+        else:
+            # "active" mode — use download source, but fall back to YouTube if Soulseek
+            _hybrid_order = config_manager.get('download_source.hybrid_order', [])
+            _hybrid_first = _hybrid_order[0] if _hybrid_order else config_manager.get('download_source.hybrid_primary', 'soulseek')
+            if download_mode == 'soulseek' or (download_mode == 'hybrid' and _hybrid_first == 'soulseek'):
+                effective_mode = 'youtube'  # Soulseek is too slow for streaming preview
+                logger.info("▶️ Stream source is 'active' but primary is Soulseek — falling back to YouTube")
+            elif download_mode == 'hybrid':
+                effective_mode = _hybrid_first
+            else:
+                effective_mode = download_mode
+
+        logger.info(f"▶️ Stream source: {stream_source} → effective: {effective_mode}")
+
+        # Generate search queries based on effective stream mode
         search_queries = []
         import re
 
-        _hybrid_order = config_manager.get('download_source.hybrid_order', [])
-        _hybrid_first = _hybrid_order[0] if _hybrid_order else config_manager.get('download_source.hybrid_primary', 'soulseek')
-        if download_mode in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl') or (download_mode == 'hybrid' and _hybrid_first in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl')):
-            # YouTube/Tidal mode: Include artist for better context
-            # Primary query: Artist + Track
+        if effective_mode in ('youtube', 'tidal', 'qobuz', 'hifi', 'deezer_dl'):
+            # Streaming sources: Include artist for better context
             if artist_name and track_name:
                 search_queries.append(f"{artist_name} {track_name}".strip())
 
@@ -7249,14 +7271,12 @@ def stream_enhanced_search_track():
             if cleaned_name and cleaned_name.lower() != track_name.lower():
                 search_queries.append(f"{artist_name} {cleaned_name}".strip())
 
-            logger.info(f"🔍 {download_mode.title()} mode: Searching with artist + track name: {search_queries}")
+            logger.info(f"🔍 {effective_mode.title()} stream: Searching with artist + track name: {search_queries}")
         else:
             # Soulseek mode: Track name only to avoid keyword filtering
-            # Primary query: Full track name
             if track_name.strip():
                 search_queries.append(track_name.strip())
 
-            # Cleaned query: Remove parentheses and brackets
             cleaned_name = re.sub(r'\s*\([^)]*\)', '', track_name).strip()
             cleaned_name = re.sub(r'\s*\[[^\]]*\]', '', cleaned_name).strip()
 
@@ -7275,13 +7295,27 @@ def stream_enhanced_search_track():
 
         search_queries = unique_queries
 
+        # Select the search client based on effective stream mode
+        _stream_clients = {
+            'youtube': soulseek_client.youtube,
+            'tidal': soulseek_client.tidal,
+            'qobuz': soulseek_client.qobuz,
+            'hifi': soulseek_client.hifi,
+            'deezer_dl': soulseek_client.deezer_dl,
+        }
+        stream_client = _stream_clients.get(effective_mode)
+        use_direct_client = stream_client is not None
+
         # Try queries sequentially until we find a good match
         for query_index, query in enumerate(search_queries):
             logger.info(f"🔍 Query {query_index + 1}/{len(search_queries)}: '{query}'")
 
             try:
-                # Search slskd with timeout
-                tracks_result, _ = run_async(soulseek_client.search(query, timeout=15))
+                # Search using the stream source client (not the download source)
+                if use_direct_client:
+                    tracks_result, _ = run_async(stream_client.search(query, timeout=15))
+                else:
+                    tracks_result, _ = run_async(soulseek_client.search(query, timeout=15))
 
                 if tracks_result:
                     logger.info(f"✅ Found {len(tracks_result)} results for query: '{query}'")
@@ -18819,6 +18853,85 @@ def get_version_info():
                     "• Listening Stats page: timeline chart, genre breakdown, top artists/albums/tracks",
                     "• Database storage donut chart in Library Health section",
                     "• Play buttons on stats page tracks with cover art"
+                ]
+            },
+            {
+                "title": "❓ Interactive Help System",
+                "description": "Full contextual help platform accessible from the floating ? button",
+                "features": [
+                    "• 200+ contextual help entries — click any UI element to learn what it does",
+                    "• 11 guided tours covering every page (97 steps total) with spotlight overlay",
+                    "• Page-aware menu suggests the relevant tour for your current page",
+                    "• Search across all help topics, tours, and keyboard shortcuts (Ctrl+K)",
+                    "• Setup Progress tracker with auto-detection — checks your services, library, and watchlist",
+                    "• What's New panel with version-tagged highlights and 'Show me' navigation",
+                    "• Troubleshoot mode scans for disconnected services and shows fix steps",
+                    "• Keyboard shortcut overlay showing all hotkeys grouped by scope",
+                    "• Quick action buttons in popovers (e.g., 'Open Settings' on service cards)",
+                    "• First-launch welcome prompt for new users"
+                ]
+            },
+            {
+                "title": "🎤 Rich Artist Profiles",
+                "description": "Full-bleed hero section on the Artists page with deep metadata",
+                "features": [
+                    "• Large portrait image with blurred background, glassmorphic design",
+                    "• Bio, genres, listening stats from Last.fm, service logo badges",
+                    "• Multi-source genre explorer with Deezer genre support",
+                    "• Similar artist cards with full-bleed library-card styling"
+                ]
+            },
+            {
+                "title": "📚 Enhanced Library Manager",
+                "description": "Inline metadata editing and tag writing from the library view",
+                "features": [
+                    "• Toggle between Standard and Enhanced view on any artist detail page",
+                    "• Inline-edit track title, number, BPM; album and artist fields editable",
+                    "• Write tags directly to audio files (MP3, FLAC, OGG, M4A) with diff preview",
+                    "• Bulk select tracks across albums for batch edit and batch tag write",
+                    "• Server sync after writes — Plex per-track, Jellyfin library scan"
+                ]
+            },
+            {
+                "title": "🏷️ In Library Badges + Search Improvements",
+                "description": "Know what you already own before downloading",
+                "features": [
+                    "• 'In Library' badges on enhanced search album and track results",
+                    "• Async post-render matching — search results appear instantly, badges fill in",
+                    "• Multi-source search tabs: compare results from Spotify, iTunes, and Deezer",
+                    "• Clickable artist name in download modal navigates to discography"
+                ]
+            },
+            {
+                "title": "🎵 FLAC Bit Depth + Quality Filter",
+                "description": "Finer control over audio quality preferences",
+                "features": [
+                    "• Quality profile enforces 16-bit vs 24-bit FLAC preference",
+                    "• Bit depth fallback option: accept other bit depth if preferred unavailable",
+                    "• 1450 kbps threshold separates 16-bit from 24-bit FLAC",
+                    "• Sort prioritizes audio quality (effective kbps) over peer speed"
+                ]
+            },
+            {
+                "title": "🔧 Enrichment Worker Improvements",
+                "description": "Better name matching and quieter logs across all 8+ workers",
+                "features": [
+                    "• Dash-suffix normalization: 'Title - Remix' now matches 'Title (Remix)' across all workers",
+                    "• AcoustID log noise reduced — individual recording matches moved to DEBUG",
+                    "• Streaming source verification: artist/title fuzzy match prevents wrong track downloads",
+                    "• Deezer enrichment worker caches API calls through metadata cache",
+                    "• Per-source quality fallback toggles for streaming download sources"
+                ]
+            },
+            {
+                "title": "🔒 Launch PIN Lock Screen",
+                "description": "Protect SoulSync access with a PIN on every page load",
+                "features": [
+                    "• Toggle in Settings → Advanced → Security to require PIN on launch",
+                    "• Full-screen lock overlay with PIN input — closing the tab requires re-entry",
+                    "• PIN validated server-side against admin profile (bcrypt hashed)",
+                    "• Inline PIN creation if admin has no PIN set",
+                    "• Shake animation on wrong PIN, auto-focus input"
                 ]
             }
         ]
@@ -33095,6 +33208,10 @@ def select_profile():
                 return jsonify({'success': False, 'error': 'Invalid PIN'}), 401
 
         session['profile_id'] = profile_id
+        # If PIN was just validated, also mark launch PIN as verified
+        # so the subsequent page reload doesn't ask again
+        if pin:
+            session['launch_pin_verified'] = True
         return jsonify({'success': True, 'profile': profile})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -33113,7 +33230,76 @@ def get_current_profile():
             session.pop('profile_id', None)
             return jsonify({'success': False, 'error': 'Profile not found'}), 200
 
-        return jsonify({'success': True, 'profile': profile})
+        # Check if launch PIN is required
+        require_pin = config_manager.get('security.require_pin_on_launch', False) if config_manager else False
+        # Check if PIN was verified this page load, then consume the flag
+        pin_verified = session.pop('launch_pin_verified', False)
+
+        return jsonify({
+            'success': True,
+            'profile': profile,
+            'launch_pin_required': bool(require_pin) and not pin_verified,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/profiles/verify-launch-pin', methods=['POST'])
+def verify_launch_pin():
+    """Verify PIN for launch lock screen"""
+    try:
+        data = request.json or {}
+        pin = data.get('pin', '')
+        if not pin:
+            return jsonify({'success': False, 'error': 'PIN required'}), 401
+
+        database = get_database()
+        # Validate against admin profile (ID 1)
+        if not database.verify_profile_pin(1, pin):
+            return jsonify({'success': False, 'error': 'Invalid PIN'}), 401
+
+        session['launch_pin_verified'] = True
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/profiles/reset-pin-via-credential', methods=['POST'])
+def reset_pin_via_credential():
+    """Reset admin PIN by verifying a known API credential"""
+    try:
+        data = request.json or {}
+        credential = (data.get('credential') or '').strip()
+        if not credential or len(credential) < 4:
+            return jsonify({'success': False, 'error': 'Enter a valid credential'}), 400
+
+        # Check credential against all stored API secrets/tokens
+        checks = [
+            ('Spotify Client Secret',  config_manager.get('spotify.client_secret', '')),
+            ('Tidal Client Secret',    config_manager.get('tidal.client_secret', '')),
+            ('Plex Token',             config_manager.get('plex.token', '')),
+            ('Jellyfin API Key',       config_manager.get('jellyfin.api_key', '')),
+            ('Navidrome Password',     config_manager.get('navidrome.password', '')),
+            ('ListenBrainz Token',     config_manager.get('listenbrainz.token', '')),
+            ('AcoustID API Key',       config_manager.get('acoustid.api_key', '')),
+            ('Last.fm API Secret',     config_manager.get('lastfm.api_secret', '')),
+            ('Genius Access Token',    config_manager.get('genius.access_token', '')),
+        ]
+
+        matched = False
+        for name, stored in checks:
+            if stored and credential == stored:
+                matched = True
+                break
+
+        if not matched:
+            return jsonify({'success': False, 'error': 'Credential does not match any configured service'}), 401
+
+        # Credential verified — clear admin PIN and disable launch lock
+        database = get_database()
+        database.update_profile(1, pin_hash=None)
+        config_manager.set('security.require_pin_on_launch', False)
+        session['launch_pin_verified'] = True
+
+        return jsonify({'success': True, 'message': 'PIN cleared and lock screen disabled. You can set a new PIN in Settings.'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -41903,7 +42089,11 @@ try:
     )
     # Start worker automatically (can be paused via UI)
     mb_worker.start()
-    print("✅ MusicBrainz enrichment worker initialized and started")
+    if config_manager.get('musicbrainz_enrichment_paused', False):
+        mb_worker.pause()
+        print("✅ MusicBrainz enrichment worker initialized (paused — restored from config)")
+    else:
+        print("✅ MusicBrainz enrichment worker initialized and started")
 except Exception as e:
     print(f"⚠️ MusicBrainz worker initialization failed: {e}")
     mb_worker = None
@@ -41938,6 +42128,7 @@ def musicbrainz_pause():
             return jsonify({'error': 'MusicBrainz worker not initialized'}), 400
         
         mb_worker.pause()
+        config_manager.set('musicbrainz_enrichment_paused', True)
         logger.info("MusicBrainz worker paused via UI")
         return jsonify({'status': 'paused'}), 200
     except Exception as e:
@@ -41952,6 +42143,7 @@ def musicbrainz_resume():
             return jsonify({'error': 'MusicBrainz worker not initialized'}), 400
         
         mb_worker.resume()
+        config_manager.set('musicbrainz_enrichment_paused', False)
         logger.info("MusicBrainz worker resumed via UI")
         return jsonify({'status': 'running'}), 200
     except Exception as e:
@@ -41974,7 +42166,11 @@ try:
     audiodb_db = MusicDatabase()
     audiodb_worker = AudioDBWorker(database=audiodb_db)
     audiodb_worker.start()
-    print("✅ AudioDB enrichment worker initialized and started")
+    if config_manager.get('audiodb_enrichment_paused', False):
+        audiodb_worker.pause()
+        print("✅ AudioDB enrichment worker initialized (paused — restored from config)")
+    else:
+        print("✅ AudioDB enrichment worker initialized and started")
 except Exception as e:
     print(f"⚠️ AudioDB worker initialization failed: {e}")
     audiodb_worker = None
@@ -42009,6 +42205,7 @@ def audiodb_pause():
             return jsonify({'error': 'AudioDB worker not initialized'}), 400
 
         audiodb_worker.pause()
+        config_manager.set('audiodb_enrichment_paused', True)
         logger.info("AudioDB worker paused via UI")
         return jsonify({'status': 'paused'}), 200
     except Exception as e:
@@ -42023,6 +42220,7 @@ def audiodb_resume():
             return jsonify({'error': 'AudioDB worker not initialized'}), 400
 
         audiodb_worker.resume()
+        config_manager.set('audiodb_enrichment_paused', False)
         logger.info("AudioDB worker resumed via UI")
         return jsonify({'status': 'running'}), 200
     except Exception as e:
@@ -42045,7 +42243,11 @@ try:
     deezer_db = MusicDatabase()
     deezer_worker = DeezerWorker(database=deezer_db)
     deezer_worker.start()
-    print("✅ Deezer enrichment worker initialized and started")
+    if config_manager.get('deezer_enrichment_paused', False):
+        deezer_worker.pause()
+        print("✅ Deezer enrichment worker initialized (paused — restored from config)")
+    else:
+        print("✅ Deezer enrichment worker initialized and started")
 except Exception as e:
     print(f"⚠️ Deezer worker initialization failed: {e}")
     deezer_worker = None
@@ -42080,6 +42282,7 @@ def deezer_pause():
             return jsonify({'error': 'Deezer worker not initialized'}), 400
 
         deezer_worker.pause()
+        config_manager.set('deezer_enrichment_paused', True)
         logger.info("Deezer worker paused via UI")
         return jsonify({'status': 'paused'}), 200
     except Exception as e:
@@ -42094,6 +42297,7 @@ def deezer_resume():
             return jsonify({'error': 'Deezer worker not initialized'}), 400
 
         deezer_worker.resume()
+        config_manager.set('deezer_enrichment_paused', False)
         logger.info("Deezer worker resumed via UI")
         return jsonify({'status': 'running'}), 200
     except Exception as e:
@@ -42116,7 +42320,11 @@ try:
     spotify_enrichment_db = MusicDatabase()
     spotify_enrichment_worker = SpotifyWorker(database=spotify_enrichment_db)
     spotify_enrichment_worker.start()
-    print("✅ Spotify enrichment worker initialized and started")
+    if config_manager.get('spotify_enrichment_paused', False):
+        spotify_enrichment_worker.pause()
+        print("✅ Spotify enrichment worker initialized (paused — restored from config)")
+    else:
+        print("✅ Spotify enrichment worker initialized and started")
 except Exception as e:
     print(f"⚠️ Spotify enrichment worker initialization failed: {e}")
     spotify_enrichment_worker = None
@@ -42151,6 +42359,7 @@ def spotify_enrichment_pause():
             return jsonify({'error': 'Spotify enrichment worker not initialized'}), 400
 
         spotify_enrichment_worker.pause()
+        config_manager.set('spotify_enrichment_paused', True)
         logger.info("Spotify enrichment worker paused via UI")
         return jsonify({'status': 'paused'}), 200
     except Exception as e:
@@ -42169,6 +42378,7 @@ def spotify_enrichment_resume():
             return jsonify({'error': 'Cannot resume while Spotify is rate limited', 'rate_limited': True}), 429
 
         spotify_enrichment_worker.resume()
+        config_manager.set('spotify_enrichment_paused', False)
         logger.info("Spotify enrichment worker resumed via UI")
         return jsonify({'status': 'running'}), 200
     except Exception as e:
@@ -42191,7 +42401,11 @@ try:
     itunes_enrichment_db = MusicDatabase()
     itunes_enrichment_worker = iTunesWorker(database=itunes_enrichment_db)
     itunes_enrichment_worker.start()
-    print("✅ iTunes enrichment worker initialized and started")
+    if config_manager.get('itunes_enrichment_paused', False):
+        itunes_enrichment_worker.pause()
+        print("✅ iTunes enrichment worker initialized (paused — restored from config)")
+    else:
+        print("✅ iTunes enrichment worker initialized and started")
 except Exception as e:
     print(f"⚠️ iTunes enrichment worker initialization failed: {e}")
     itunes_enrichment_worker = None
@@ -42226,6 +42440,7 @@ def itunes_enrichment_pause():
             return jsonify({'error': 'iTunes enrichment worker not initialized'}), 400
 
         itunes_enrichment_worker.pause()
+        config_manager.set('itunes_enrichment_paused', True)
         logger.info("iTunes enrichment worker paused via UI")
         return jsonify({'status': 'paused'}), 200
     except Exception as e:
@@ -42240,6 +42455,7 @@ def itunes_enrichment_resume():
             return jsonify({'error': 'iTunes enrichment worker not initialized'}), 400
 
         itunes_enrichment_worker.resume()
+        config_manager.set('itunes_enrichment_paused', False)
         logger.info("iTunes enrichment worker resumed via UI")
         return jsonify({'status': 'running'}), 200
     except Exception as e:
@@ -42261,7 +42477,11 @@ try:
     lastfm_db = MusicDatabase()
     lastfm_worker = LastFMWorker(database=lastfm_db)
     lastfm_worker.start()
-    print("✅ Last.fm enrichment worker initialized and started")
+    if config_manager.get('lastfm_enrichment_paused', False):
+        lastfm_worker.pause()
+        print("✅ Last.fm enrichment worker initialized (paused — restored from config)")
+    else:
+        print("✅ Last.fm enrichment worker initialized and started")
 except Exception as e:
     print(f"⚠️ Last.fm worker initialization failed: {e}")
     lastfm_worker = None
@@ -42296,6 +42516,7 @@ def lastfm_enrichment_pause():
             return jsonify({'error': 'Last.fm worker not initialized'}), 400
 
         lastfm_worker.pause()
+        config_manager.set('lastfm_enrichment_paused', True)
         logger.info("Last.fm worker paused via UI")
         return jsonify({'status': 'paused'}), 200
     except Exception as e:
@@ -42310,6 +42531,7 @@ def lastfm_enrichment_resume():
             return jsonify({'error': 'Last.fm worker not initialized'}), 400
 
         lastfm_worker.resume()
+        config_manager.set('lastfm_enrichment_paused', False)
         logger.info("Last.fm worker resumed via UI")
         return jsonify({'status': 'running'}), 200
     except Exception as e:
@@ -42395,7 +42617,11 @@ try:
     genius_db = MusicDatabase()
     genius_worker = GeniusWorker(database=genius_db)
     genius_worker.start()
-    print("✅ Genius enrichment worker initialized and started")
+    if config_manager.get('genius_enrichment_paused', False):
+        genius_worker.pause()
+        print("✅ Genius enrichment worker initialized (paused — restored from config)")
+    else:
+        print("✅ Genius enrichment worker initialized and started")
 except Exception as e:
     print(f"⚠️ Genius worker initialization failed: {e}")
     genius_worker = None
@@ -42430,6 +42656,7 @@ def genius_enrichment_pause():
             return jsonify({'error': 'Genius worker not initialized'}), 400
 
         genius_worker.pause()
+        config_manager.set('genius_enrichment_paused', True)
         logger.info("Genius worker paused via UI")
         return jsonify({'status': 'paused'}), 200
     except Exception as e:
@@ -42444,6 +42671,7 @@ def genius_enrichment_resume():
             return jsonify({'error': 'Genius worker not initialized'}), 400
 
         genius_worker.resume()
+        config_manager.set('genius_enrichment_paused', False)
         logger.info("Genius worker resumed via UI")
         return jsonify({'status': 'running'}), 200
     except Exception as e:
@@ -42464,7 +42692,11 @@ try:
     tidal_enrich_db = MusicDatabase()
     tidal_enrichment_worker = TidalWorker(database=tidal_enrich_db, client=tidal_client)
     tidal_enrichment_worker.start()
-    print("✅ Tidal enrichment worker initialized and started")
+    if config_manager.get('tidal_enrichment_paused', False):
+        tidal_enrichment_worker.pause()
+        print("✅ Tidal enrichment worker initialized (paused — restored from config)")
+    else:
+        print("✅ Tidal enrichment worker initialized and started")
 except Exception as e:
     print(f"⚠️ Tidal worker initialization failed: {e}")
     tidal_enrichment_worker = None
@@ -42500,6 +42732,7 @@ def tidal_enrichment_pause():
             return jsonify({'error': 'Tidal worker not initialized'}), 400
 
         tidal_enrichment_worker.pause()
+        config_manager.set('tidal_enrichment_paused', True)
         logger.info("Tidal worker paused via UI")
         return jsonify({'status': 'paused'}), 200
     except Exception as e:
@@ -42514,6 +42747,7 @@ def tidal_enrichment_resume():
             return jsonify({'error': 'Tidal worker not initialized'}), 400
 
         tidal_enrichment_worker.resume()
+        config_manager.set('tidal_enrichment_paused', False)
         logger.info("Tidal worker resumed via UI")
         return jsonify({'status': 'running'}), 200
     except Exception as e:
@@ -42532,7 +42766,11 @@ try:
     qobuz_enrich_client = QobuzClient()  # Separate client instance for thread safety
     qobuz_enrichment_worker = QobuzWorker(database=qobuz_enrich_db, client=qobuz_enrich_client)
     qobuz_enrichment_worker.start()
-    print("✅ Qobuz enrichment worker initialized and started")
+    if config_manager.get('qobuz_enrichment_paused', False):
+        qobuz_enrichment_worker.pause()
+        print("✅ Qobuz enrichment worker initialized (paused — restored from config)")
+    else:
+        print("✅ Qobuz enrichment worker initialized and started")
 except Exception as e:
     print(f"⚠️ Qobuz worker initialization failed: {e}")
     qobuz_enrichment_worker = None
@@ -42568,6 +42806,7 @@ def qobuz_enrichment_pause():
             return jsonify({'error': 'Qobuz worker not initialized'}), 400
 
         qobuz_enrichment_worker.pause()
+        config_manager.set('qobuz_enrichment_paused', True)
         logger.info("Qobuz worker paused via UI")
         return jsonify({'status': 'paused'}), 200
     except Exception as e:
@@ -42582,6 +42821,7 @@ def qobuz_enrichment_resume():
             return jsonify({'error': 'Qobuz worker not initialized'}), 400
 
         qobuz_enrichment_worker.resume()
+        config_manager.set('qobuz_enrichment_paused', False)
         logger.info("Qobuz worker resumed via UI")
         return jsonify({'status': 'running'}), 200
     except Exception as e:
@@ -44432,6 +44672,59 @@ def _build_watchlist_count_payload(profile_id=1):
         'next_run_in_seconds': next_run_in_seconds
     }
 
+def _hydrabase_reconnect_loop():
+    """Background thread that monitors Hydrabase connection and auto-reconnects if needed."""
+    global _hydrabase_ws
+    _consecutive_failures = 0
+
+    while True:
+        socketio.sleep(30)
+        try:
+            # Only attempt reconnect if auto_connect is enabled
+            hydra_cfg = config_manager.get_hydrabase_config()
+            if not hydra_cfg.get('auto_connect') or not hydra_cfg.get('url') or not hydra_cfg.get('api_key'):
+                _consecutive_failures = 0
+                continue
+
+            # Check if already connected
+            try:
+                if _hydrabase_ws is not None and _hydrabase_ws.connected:
+                    _consecutive_failures = 0
+                    continue
+            except Exception:
+                pass  # Socket in bad state — treat as disconnected
+
+            # Disconnected with auto_connect enabled — try to reconnect
+            # Back off: 30s, 60s, 120s, max 300s between attempts
+            backoff = min(30 * (2 ** _consecutive_failures), 300)
+            if _consecutive_failures > 0:
+                socketio.sleep(backoff - 30)  # Already slept 30s at top of loop
+
+            import websocket
+            try:
+                with _hydrabase_lock:
+                    if _hydrabase_ws:
+                        try:
+                            _hydrabase_ws.close()
+                        except:
+                            pass
+                    ws = websocket.create_connection(
+                        hydra_cfg['url'],
+                        header={"x-api-key": hydra_cfg['api_key']},
+                        timeout=10
+                    )
+                    _hydrabase_ws = ws
+                _consecutive_failures = 0
+                print(f"🔄 [Hydrabase] Auto-reconnected to {hydra_cfg['url']}")
+            except Exception as e:
+                _consecutive_failures += 1
+                if _consecutive_failures <= 3:
+                    print(f"⚠️ [Hydrabase] Reconnect attempt failed ({_consecutive_failures}): {e}")
+                elif _consecutive_failures == 4:
+                    print(f"⚠️ [Hydrabase] Reconnect failing repeatedly — suppressing further logs until success")
+        except Exception:
+            pass  # Don't crash the monitor loop
+
 def _emit_service_status_loop():
     """Background thread that pushes service status every 5 seconds."""
     while True:
@@ -44943,6 +45236,8 @@ if __name__ == '__main__':
     socketio.start_background_task(_emit_automation_progress_loop)
     # Phase 7: Repair job progress
     socketio.start_background_task(_emit_repair_progress_loop)
+    # Hydrabase auto-reconnect monitor
+    socketio.start_background_task(_hydrabase_reconnect_loop)
     print("✅ WebSocket emitters started (Phase 1-7: global/dashboard/enrichment/tools/sync/automations/repair)")
 
     socketio.run(app, host='0.0.0.0', port=8008, debug=False, allow_unsafe_werkzeug=True)

@@ -966,6 +966,13 @@ async function initProfileSystem() {
         if (currentData.success && currentData.profile) {
             currentProfile = currentData.profile;
             updateProfileIndicator();
+
+            // Check if launch PIN is required
+            if (currentData.launch_pin_required) {
+                showLaunchPinScreen();
+                return false; // Defer app init until PIN verified
+            }
+
             return true; // Profile already selected, skip picker
         }
 
@@ -983,6 +990,15 @@ async function initProfileSystem() {
         if (profiles.length === 1) {
             // Only one profile — always auto-select (PIN only matters with multiple profiles)
             await selectProfile(profiles[0].id);
+
+            // Re-check for launch PIN after auto-select
+            const recheck = await fetch('/api/profiles/current');
+            const recheckData = await recheck.json();
+            if (recheckData.launch_pin_required) {
+                showLaunchPinScreen();
+                return false;
+            }
+
             return true;
         }
 
@@ -993,6 +1009,199 @@ async function initProfileSystem() {
         console.error('Profile init error:', e);
         return true; // Fall through to normal init
     }
+}
+
+// ── Launch PIN Lock Screen ─────────────────────────────────────────────
+
+function showLaunchPinScreen() {
+    const overlay = document.getElementById('launch-pin-overlay');
+    if (!overlay) return;
+    overlay.style.display = 'flex';
+
+    const input = document.getElementById('launch-pin-input');
+    const submit = document.getElementById('launch-pin-submit');
+    const error = document.getElementById('launch-pin-error');
+
+    input.value = '';
+    error.style.display = 'none';
+    setTimeout(() => input.focus(), 100);
+
+    const doSubmit = async () => {
+        const pin = input.value.trim();
+        if (!pin) return;
+
+        submit.disabled = true;
+        submit.textContent = 'Verifying...';
+
+        try {
+            const res = await fetch('/api/profiles/verify-launch-pin', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ pin })
+            });
+            const data = await res.json();
+
+            if (data.success) {
+                // Server session flag set by verify endpoint — consumed on next /api/profiles/current call
+                overlay.style.display = 'none';
+                initApp(); // Now safe to load the full app
+            } else {
+                error.textContent = data.error || 'Invalid PIN';
+                error.style.display = 'block';
+                input.value = '';
+                input.focus();
+                // Shake animation
+                overlay.querySelector('.launch-pin-container').classList.add('shake');
+                setTimeout(() => overlay.querySelector('.launch-pin-container').classList.remove('shake'), 500);
+            }
+        } catch (e) {
+            error.textContent = 'Connection error';
+            error.style.display = 'block';
+        }
+
+        submit.disabled = false;
+        submit.textContent = 'Unlock';
+    };
+
+    // Remove old listeners to prevent stacking
+    const newSubmit = submit.cloneNode(true);
+    submit.parentNode.replaceChild(newSubmit, submit);
+    newSubmit.addEventListener('click', doSubmit);
+
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') doSubmit();
+    });
+}
+
+// ── Security Settings Helpers ──────────────────────────────────────────
+
+async function saveSecurityPin() {
+    const pin = document.getElementById('security-new-pin').value;
+    const confirm = document.getElementById('security-confirm-pin').value;
+    const msg = document.getElementById('security-pin-msg');
+
+    if (!pin || pin.length < 4) {
+        msg.textContent = 'PIN must be at least 4 characters';
+        msg.style.display = 'block';
+        msg.style.color = '#ff5252';
+        return;
+    }
+    if (pin !== confirm) {
+        msg.textContent = 'PINs do not match';
+        msg.style.display = 'block';
+        msg.style.color = '#ff5252';
+        return;
+    }
+
+    try {
+        const res = await fetch('/api/profiles/1/set-pin', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin })
+        });
+        const data = await res.json();
+
+        if (data.success) {
+            msg.textContent = 'PIN saved! You can now enable the lock screen.';
+            msg.style.color = '#4caf50';
+            msg.style.display = 'block';
+
+            // Update UI — hide setup, show change, enable toggle
+            document.getElementById('security-pin-setup').style.display = 'none';
+            document.getElementById('security-change-pin-section').style.display = 'block';
+            document.getElementById('security-require-pin').disabled = false;
+
+            // Clear inputs
+            document.getElementById('security-new-pin').value = '';
+            document.getElementById('security-confirm-pin').value = '';
+        } else {
+            msg.textContent = data.error || 'Failed to save PIN';
+            msg.style.color = '#ff5252';
+            msg.style.display = 'block';
+        }
+    } catch (e) {
+        msg.textContent = 'Connection error';
+        msg.style.color = '#ff5252';
+        msg.style.display = 'block';
+    }
+}
+
+function handleSecurityPinToggle(checkbox) {
+    // If trying to enable but no PIN, show the setup section
+    if (checkbox.checked) {
+        const setupSection = document.getElementById('security-pin-setup');
+        if (setupSection.style.display !== 'none' || checkbox.disabled) {
+            checkbox.checked = false;
+            setupSection.style.display = 'block';
+            document.getElementById('security-new-pin').focus();
+            return;
+        }
+    }
+    // Auto-save this setting
+    saveSettings(true);
+}
+
+function showChangeSecurityPin() {
+    document.getElementById('security-pin-setup').style.display = 'block';
+    document.getElementById('security-new-pin').focus();
+}
+
+// ── Forgot PIN Recovery ────────────────────────────────────────────────
+
+function showForgotPinView() {
+    document.getElementById('launch-pin-entry').style.display = 'none';
+    document.getElementById('launch-pin-recovery').style.display = 'block';
+    document.getElementById('launch-recovery-input').value = '';
+    document.getElementById('launch-recovery-error').style.display = 'none';
+    setTimeout(() => document.getElementById('launch-recovery-input').focus(), 100);
+}
+
+function showPinEntryView() {
+    document.getElementById('launch-pin-recovery').style.display = 'none';
+    document.getElementById('launch-pin-entry').style.display = 'block';
+    setTimeout(() => document.getElementById('launch-pin-input').focus(), 100);
+}
+
+async function submitRecoveryCredential() {
+    const input = document.getElementById('launch-recovery-input');
+    const error = document.getElementById('launch-recovery-error');
+    const btn = document.getElementById('launch-recovery-submit');
+    const credential = input.value.trim();
+
+    if (!credential) return;
+
+    btn.disabled = true;
+    btn.textContent = 'Verifying...';
+    error.style.display = 'none';
+
+    try {
+        const res = await fetch('/api/profiles/reset-pin-via-credential', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ credential })
+        });
+        const data = await res.json();
+
+        if (data.success) {
+            sessionStorage.setItem('soulsync_pin_ok', '1');
+            document.getElementById('launch-pin-overlay').style.display = 'none';
+            initApp();
+            setTimeout(() => showToast('PIN cleared. You can set a new one in Settings → Advanced.', 'success'), 1000);
+        } else {
+            error.textContent = data.error || 'Credential not recognized';
+            error.style.display = 'block';
+            input.value = '';
+            input.focus();
+            document.getElementById('launch-pin-container').classList.add('shake');
+            setTimeout(() => document.getElementById('launch-pin-container').classList.remove('shake'), 500);
+        }
+    } catch (e) {
+        error.textContent = 'Connection error';
+        error.style.display = 'block';
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'Verify & Reset PIN';
 }
 
 function showProfilePicker(profiles, canCancel = false) {
@@ -5547,6 +5756,7 @@ async function loadSettingsData() {
 
         // Populate Download Source settings
         document.getElementById('download-source-mode').value = settings.download_source?.mode || 'soulseek';
+        document.getElementById('stream-source').value = settings.download_source?.stream_source || 'youtube';
         loadHybridSourceOrder(settings);
         document.getElementById('tidal-download-quality').value = settings.tidal_download?.quality || 'lossless';
         document.getElementById('tidal-allow-fallback').checked = settings.tidal_download?.allow_fallback !== false;
@@ -5704,6 +5914,30 @@ async function loadSettingsData() {
             }
         } catch (error) {
             console.error('Error loading log level:', error);
+        }
+
+        // Load security settings
+        try {
+            const requirePin = settings.security?.require_pin_on_launch || false;
+            document.getElementById('security-require-pin').checked = requirePin;
+
+            // Check if admin has a PIN set
+            const profilesRes = await fetch('/api/profiles');
+            const profilesData = await profilesRes.json();
+            const adminProfile = (profilesData.profiles || []).find(p => p.is_admin);
+            const adminHasPin = adminProfile?.has_pin || false;
+
+            // Show/hide PIN setup vs change sections
+            document.getElementById('security-pin-setup').style.display = adminHasPin ? 'none' : 'block';
+            document.getElementById('security-change-pin-section').style.display = adminHasPin ? 'block' : 'none';
+
+            // If no PIN, disable the toggle
+            if (!adminHasPin) {
+                document.getElementById('security-require-pin').checked = false;
+                document.getElementById('security-require-pin').disabled = true;
+            }
+        } catch (error) {
+            console.error('Error loading security settings:', error);
         }
 
         // Check dev mode status
@@ -6551,6 +6785,7 @@ async function saveSettings(quiet = false) {
             hybrid_primary: document.getElementById('hybrid-primary-source').value,
             hybrid_secondary: document.getElementById('hybrid-secondary-source').value,
             hybrid_order: getHybridOrder(),
+            stream_source: document.getElementById('stream-source').value,
         },
         tidal_download: {
             quality: document.getElementById('tidal-download-quality').value || 'lossless',
@@ -6638,6 +6873,9 @@ async function saveSettings(quiet = false) {
         youtube: {
             cookies_browser: document.getElementById('youtube-cookies-browser').value,
             download_delay: parseInt(document.getElementById('youtube-download-delay').value) || 3,
+        },
+        security: {
+            require_pin_on_launch: document.getElementById('security-require-pin')?.checked || false,
         }
     };
 
@@ -8261,10 +8499,13 @@ function initializeSearchModeToggle() {
             // Format playlist name
             const playlistName = `[${album.artist}] ${albumData.name}`;
 
-            // Create minimal artist object for the modal
+            // Create artist object for the modal — extract ID from album data
+            const firstArtist = (albumData.artists || [])[0] || {};
             const artistObject = {
-                id: null, // No artist ID from enhanced search
-                name: album.artist
+                id: firstArtist.id || album.id?.split?.('_')?.[0] || '',
+                name: firstArtist.name || album.artist,
+                image_url: firstArtist.image_url || firstArtist.images?.[0]?.url || '',
+                source: _activeSearchSource || '',
             };
 
             // Prepare full album object for modal
@@ -10710,7 +10951,7 @@ function generateDownloadModalHeroSection(context) {
                     </div>
                     <div class="download-missing-modal-hero-metadata">
                         <h1 class="download-missing-modal-hero-title">${escapeHtml(album.name || 'Unknown Album')}</h1>
-                        <div class="download-missing-modal-hero-subtitle">by ${escapeHtml(artist.name || 'Unknown Artist')}</div>
+                        <div class="download-missing-modal-hero-subtitle">by <a href="#" class="hero-artist-link" onclick="event.preventDefault();_navigateToArtistFromModal('${escapeHtml(artist.id || '')}','${escapeForInlineJs(artist.name || '')}','${escapeHtml(artist.image_url || '')}','${escapeHtml(artist.source || '')}','${escapeHtml(context.playlistId || '')}')">${escapeHtml(artist.name || 'Unknown Artist')}</a></div>
                         <div class="download-missing-modal-hero-details">
                             <span class="download-missing-modal-hero-detail">${album.album_type || 'Album'}</span>
                             <span class="download-missing-modal-hero-detail">${trackCount} tracks</span>
@@ -11443,6 +11684,22 @@ async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistNam
     applyProgressiveTrackRendering(virtualPlaylistId, spotifyTracks.length);
     modal.style.display = 'flex';
     hideLoadingOverlay();
+}
+
+function _navigateToArtistFromModal(artistId, artistName, imageUrl, source, playlistId) {
+    if (!artistName) return;
+    // Close the download modal
+    if (playlistId) closeDownloadMissingModal(playlistId);
+    // Navigate to Artists page and load discography
+    navigateToPage('artists');
+    setTimeout(() => {
+        // If we have an artist ID, use it directly
+        // If not, search by name — selectArtistForDetail handles both
+        selectArtistForDetail(
+            { id: artistId || artistName, name: artistName, image_url: imageUrl || '' },
+            source ? { source: source } : undefined
+        );
+    }, 200);
 }
 
 async function closeDownloadMissingModal(playlistId) {
@@ -36806,7 +37063,7 @@ async function openWatchlistArtistDetailView(artistId, artistName) {
             return;
         }
 
-        const { config, artist, recent_releases } = data;
+        const { config, artist, recent_releases, spotify_artist_id, itunes_artist_id, deezer_artist_id } = data;
 
         // Remove existing overlay if any
         const existing = document.querySelector('.watchlist-artist-detail-overlay');
@@ -36917,6 +37174,7 @@ async function openWatchlistArtistDetailView(artistId, artistName) {
                 </div>
 
                 <div class="watchlist-detail-actions">
+                    <button class="watchlist-detail-discog-btn watchlist-detail-discog-action">View Discography</button>
                     <button class="watchlist-detail-settings-btn watchlist-detail-settings-action">Settings</button>
                     <button class="watchlist-detail-remove-btn watchlist-detail-remove-action">Remove from Watchlist</button>
                 </div>
@@ -36926,6 +37184,35 @@ async function openWatchlistArtistDetailView(artistId, artistName) {
         // Wire up event listeners (avoids inline onclick escaping issues)
         overlay.querySelector('.watchlist-detail-back-btn').addEventListener('click', () => {
             closeWatchlistArtistDetailView();
+        });
+
+        overlay.querySelector('.watchlist-detail-discog-action').addEventListener('click', () => {
+            // Use the ID matching the active metadata source
+            let discogId, source;
+            const activeSrc = (currentMusicSourceName || '').toLowerCase();
+            if (activeSrc.includes('spotify') && spotify_artist_id) {
+                discogId = spotify_artist_id; source = 'spotify';
+            } else if (activeSrc.includes('deezer') && deezer_artist_id) {
+                discogId = deezer_artist_id; source = 'deezer';
+            } else if (itunes_artist_id) {
+                discogId = itunes_artist_id; source = 'itunes';
+            } else {
+                discogId = spotify_artist_id || deezer_artist_id || itunes_artist_id;
+                source = spotify_artist_id ? 'spotify' : deezer_artist_id ? 'deezer' : 'itunes';
+            }
+            if (discogId) {
+                // Close watchlist modal + detail overlay
+                closeWatchlistArtistDetailView();
+                closeWatchlistModal();
+                // Navigate to Artists page and load discography
+                navigateToPage('artists');
+                setTimeout(() => {
+                    selectArtistForDetail(
+                        { id: discogId, name: artistName, image_url: artist.image_url || '' },
+                        { source: source }
+                    );
+                }, 200);
+            }
         });
 
         overlay.querySelector('.watchlist-detail-settings-action').addEventListener('click', () => {
@@ -42938,6 +43225,27 @@ async function playLibraryTrack(track, albumTitle, artistName) {
 
         const result = await response.json();
         if (!result.success) {
+            // File not on disk — fall back to streaming from configured source
+            console.warn('Library file not found, falling back to stream source');
+            hideLoadingAnimation();
+            const streamRes = await fetch('/api/enhanced-search/stream-track', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    track_name: track.title || '',
+                    artist_name: artistName || '',
+                    album_name: albumTitle || '',
+                })
+            });
+            const streamData = await streamRes.json();
+            if (streamData.success && streamData.result) {
+                streamData.result.artist = artistName;
+                streamData.result.title = track.title;
+                streamData.result.album = albumTitle;
+                streamData.result.image_url = track._stats_image || null;
+                startStream(streamData.result);
+                return;
+            }
             throw new Error(result.error || 'Failed to start library playback');
         }
 
@@ -57301,7 +57609,8 @@ function renderMirroredCard(p, container) {
     let ratioHtml = '';
     if (disc > 0) {
         const complete = disc >= tot;
-        ratioHtml = `<span class="discovery-ratio${complete ? ' complete' : ''}">${disc}/${tot} discovered</span>`;
+        const srcName = typeof currentMusicSourceName !== 'undefined' ? currentMusicSourceName : 'metadata';
+        ratioHtml = `<span class="discovery-ratio${complete ? ' complete' : ''}">${disc}/${tot} discovered on ${srcName}</span>`;
     }
 
     const card = document.createElement('div');
